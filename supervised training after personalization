@@ -1,0 +1,398 @@
+# =========================================================
+# LSTM / GRU / TCN — LOSO + Cluster-Aware Fine-Tuning
+# Strategy:
+#   1. Train generalized model on all participants except left-out
+#   2. Fine-tune on the left-out subject's cluster (excluding that subject)
+#   3. Evaluate on the left-out subject
+# =========================================================
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import copy
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# =========================================================
+# A. CLUSTER ASSIGNMENT
+# =========================================================
+cluster_map = {
+    1: 0,  7: 0,  6: 0, 16: 0, 15: 0, 13: 0, 12: 0,  9: 0,
+    8: 1,  5: 1,  4: 1,  2: 1,  3: 1, 10: 1, 14: 1, 17: 1,
+   18: 1, 19: 1, 20: 1, 21: 1, 22: 1, 23: 1, 24: 1, 11: 1
+}
+
+
+# =========================================================
+# B. CONFIG
+# =========================================================
+feature_cols = [
+    "EDA",
+    "LeftPupilDiameter", "RightPupilDiameter",
+    "LeftPupilPosInSensorX", "LeftPupilPosInSensorY",
+    "RightPupilPosInSensorX", "RightPupilPosInSensorY",
+    "NrmSRLeftEyeGazeDirX", "NrmSRLeftEyeGazeDirY", "NrmSRLeftEyeGazeDirZ",
+    "NrmSRRightEyeGazeDirX", "NrmSRRightEyeGazeDirY", "NrmSRRightEyeGazeDirZ"
+]
+
+TARGET_COL   = "FMS"
+SEQUENCE_LEN = 200
+BATCH_SIZE   = 32
+EPOCHS_GEN   = 30       # generalized training
+EPOCHS_FT    = 15       # cluster fine-tuning
+LR           = 1e-3
+FT_LR        = 1e-4
+DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Device: {DEVICE}")
+
+
+# =========================================================
+# C. BUILD PER-PARTICIPANT WINDOWS
+# =========================================================
+def build_participant_data(df, feature_cols, target_col, seq_len):
+    df_clean = df.copy()
+    df_clean["participant"] = (
+        df_clean["participant"].astype(str)
+        .str.extract(r"(\d+)", expand=False).astype(int)
+    )
+    df_clean[target_col] = pd.to_numeric(df_clean[target_col], errors="coerce")
+    df_clean = df_clean.sort_values(["participant", "Timestamp"]).reset_index(drop=True)
+
+    pid_data = {}
+
+    for pid, g in df_clean.groupby("participant"):
+        g = g.reset_index(drop=True)
+        valid_mask = g[feature_cols + [target_col]].notna().all(axis=1)
+        g_valid    = g[valid_mask].reset_index(drop=True)
+
+        if len(g_valid) < seq_len:
+            print(f"  PID {pid}: not enough valid rows ({len(g_valid)}) — skipping")
+            continue
+
+        scaler    = MinMaxScaler()
+        feat_vals = scaler.fit_transform(g_valid[feature_cols]).astype(np.float32)
+        fms_arr   = g_valid[target_col].values.astype(np.float32)
+
+        windows, targets = [], []
+        for i in range(0, len(feat_vals) - seq_len, seq_len):
+            windows.append(feat_vals[i : i + seq_len])
+            targets.append(fms_arr[i + seq_len - 1])
+
+        if not windows:
+            print(f"  PID {pid}: no windows produced — skipping")
+            continue
+
+        pid_data[pid] = {
+            "X": np.array(windows, dtype=np.float32),
+            "y": np.array(targets,  dtype=np.float32)
+        }
+        y = pid_data[pid]["y"]
+        print(f"  PID {pid:>3}: {len(windows):>4} windows | "
+              f"FMS [{y.min():.0f}–{y.max():.0f}] | unique: {np.unique(y)}")
+
+    return pid_data
+
+
+print("\nBuilding windowed dataset...")
+pid_data = build_participant_data(final, feature_cols, TARGET_COL, SEQUENCE_LEN)
+all_pids = sorted(pid_data.keys())
+
+print(f"\nParticipants with valid data: {len(all_pids)}")
+print("PIDs:", all_pids)
+
+
+# =========================================================
+# D. DATASET HELPERS
+# =========================================================
+def pids_to_tensors(pid_data, pid_list):
+    Xs = [pid_data[p]["X"] for p in pid_list if p in pid_data]
+    ys = [pid_data[p]["y"] for p in pid_list if p in pid_data]
+    if not Xs:
+        return None, None
+    return (torch.tensor(np.concatenate(Xs, axis=0)),
+            torch.tensor(np.concatenate(ys, axis=0)).unsqueeze(1))
+
+def make_loader(X, y, batch_size, shuffle=True):
+    return DataLoader(TensorDataset(X, y), batch_size=batch_size, shuffle=shuffle)
+
+
+# =========================================================
+# E. MODELS
+# =========================================================
+class LSTMRegressor(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
+                            batch_first=True, dropout=dropout)
+        self.fc = nn.Sequential(nn.Linear(hidden_size, 32), nn.ReLU(), nn.Linear(32, 1))
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+class GRURegressor(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.2):
+        super().__init__()
+        self.gru = nn.GRU(input_size, hidden_size, num_layers=num_layers,
+                          batch_first=True, dropout=dropout)
+        self.fc = nn.Sequential(nn.Linear(hidden_size, 32), nn.ReLU(), nn.Linear(32, 1))
+    def forward(self, x):
+        out, _ = self.gru(x)
+        return self.fc(out[:, -1, :])
+
+class CausalConv1d(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv    = nn.Conv1d(in_ch, out_ch, kernel_size,
+                                 padding=self.padding, dilation=dilation)
+    def forward(self, x):
+        return self.conv(x)[:, :, :-self.padding] if self.padding else self.conv(x)
+
+class TCNBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation, dropout=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            CausalConv1d(in_ch, out_ch, kernel_size, dilation), nn.BatchNorm1d(out_ch),
+            nn.ReLU(), nn.Dropout(dropout),
+            CausalConv1d(out_ch, out_ch, kernel_size, dilation), nn.BatchNorm1d(out_ch),
+            nn.ReLU(), nn.Dropout(dropout)
+        )
+        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
+    def forward(self, x):
+        res = x if self.downsample is None else self.downsample(x)
+        return nn.functional.relu(self.net(x) + res)
+
+class TCNRegressor(nn.Module):
+    def __init__(self, input_size, num_channels=None, kernel_size=3, dropout=0.2):
+        super().__init__()
+        if num_channels is None:
+            num_channels = [64, 64, 128]
+        layers, in_ch = [], input_size
+        for i, out_ch in enumerate(num_channels):
+            layers.append(TCNBlock(in_ch, out_ch, kernel_size,
+                                   dilation=2**i, dropout=dropout))
+            in_ch = out_ch
+        self.tcn = nn.Sequential(*layers)
+        self.fc  = nn.Sequential(nn.Linear(num_channels[-1], 32),
+                                 nn.ReLU(), nn.Linear(32, 1))
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        return self.fc(self.tcn(x)[:, :, -1])
+
+def get_model(name, input_size, device):
+    return {"LSTM": LSTMRegressor,
+            "GRU":  GRURegressor,
+            "TCN":  TCNRegressor}[name](input_size).to(device)
+
+
+# =========================================================
+# F. TRAIN / EVAL
+# =========================================================
+def train_model(model, loader, optimizer, criterion, epochs, device):
+    model.train()
+    for _ in range(epochs):
+        for Xb, yb in loader:
+            Xb, yb = Xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            criterion(model(Xb), yb).backward()
+            optimizer.step()
+
+def evaluate_model(model, X_tensor, y_tensor, device):
+    model.eval()
+    with torch.no_grad():
+        preds = model(X_tensor.to(device)).cpu().numpy().flatten()
+    targets = y_tensor.numpy().flatten()
+    return {
+        "MAE":     round(float(mean_absolute_error(targets, preds)),  4),
+        "RMSE":    round(float(np.sqrt(mean_squared_error(targets, preds))), 4),
+        "preds":   preds,
+        "targets": targets
+    }
+
+
+# =========================================================
+# G. CLUSTER LOOKUP
+# =========================================================
+# pids in each cluster that also have valid windowed data
+cluster_to_pids = {0: [], 1: []}
+for pid in all_pids:
+    c = cluster_map.get(pid)
+    if c is not None:
+        cluster_to_pids[c].append(pid)
+
+print("\nCluster → PIDs (valid data only):")
+for c, pids in cluster_to_pids.items():
+    print(f"  Cluster {c}: {pids}")
+
+
+# =========================================================
+# H. MAIN LOOP
+# =========================================================
+MODEL_NAMES  = ["LSTM", "GRU", "TCN"]
+criterion    = nn.MSELoss()
+INPUT_SIZE   = len(feature_cols)
+results_rows = []
+
+for left_out_pid in all_pids:
+
+    left_out_cluster = cluster_map.get(left_out_pid)
+
+    # cluster peers = same cluster, excluding the left-out subject
+    cluster_peers = [
+        p for p in cluster_to_pids.get(left_out_cluster, [])
+        if p != left_out_pid
+    ]
+
+    fms_range = (f"[{pid_data[left_out_pid]['y'].min():.0f}"
+                 f"–{pid_data[left_out_pid]['y'].max():.0f}]")
+
+    print(f"\n{'='*65}")
+    print(f"Left-out PID: {left_out_pid} | Cluster: {left_out_cluster} | FMS={fms_range}")
+    print(f"  Gen. train : {[p for p in all_pids if p != left_out_pid]}")
+    print(f"  FT peers   : {cluster_peers}")
+    print(f"{'='*65}")
+
+    # tensors
+    X_train_gen, y_train_gen = pids_to_tensors(
+        pid_data, [p for p in all_pids if p != left_out_pid]
+    )
+    X_test, y_test = pids_to_tensors(pid_data, [left_out_pid])
+    loader_gen     = make_loader(X_train_gen, y_train_gen, BATCH_SIZE)
+
+    # fine-tune data (may be None if subject is alone in cluster)
+    X_ft, y_ft   = pids_to_tensors(pid_data, cluster_peers)
+    has_ft_data  = X_ft is not None
+    if has_ft_data:
+        loader_ft = make_loader(X_ft, y_ft, BATCH_SIZE)
+    else:
+        print(f"  ⚠  No cluster peers with data — fine-tuning skipped")
+
+    for model_name in MODEL_NAMES:
+
+        # --------------------------------------------------
+        # STEP 1 — Generalized (all data minus left-out)
+        # --------------------------------------------------
+        gen_model = get_model(model_name, INPUT_SIZE, DEVICE)
+        opt_gen   = torch.optim.Adam(gen_model.parameters(), lr=LR)
+        train_model(gen_model, loader_gen, opt_gen, criterion, EPOCHS_GEN, DEVICE)
+        gen_metrics = evaluate_model(gen_model, X_test, y_test, DEVICE)
+
+        # --------------------------------------------------
+        # STEP 2 — Fine-tune on cluster peers
+        # --------------------------------------------------
+        if has_ft_data:
+            ft_model = copy.deepcopy(gen_model)
+            opt_ft   = torch.optim.Adam(ft_model.parameters(), lr=FT_LR)
+            train_model(ft_model, loader_ft, opt_ft, criterion, EPOCHS_FT, DEVICE)
+            ft_metrics = evaluate_model(ft_model, X_test, y_test, DEVICE)
+        else:
+            ft_metrics = {"MAE": np.nan, "RMSE": np.nan}
+
+        print(f"  {model_name:<5} "
+              f"GEN  MAE={gen_metrics['MAE']:.4f}  RMSE={gen_metrics['RMSE']:.4f} | "
+              f"FT   MAE={ft_metrics['MAE'] if not np.isnan(ft_metrics['MAE']) else 'N/A':>7}  "
+              f"RMSE={ft_metrics['RMSE'] if not np.isnan(ft_metrics['RMSE']) else 'N/A':>7}")
+
+        results_rows.append({
+            "pid":             left_out_pid,
+            "cluster":         left_out_cluster,
+            "model":           model_name,
+            "GEN_MAE":         gen_metrics["MAE"],
+            "GEN_RMSE":        gen_metrics["RMSE"],
+            "FT_MAE":          ft_metrics["MAE"],
+            "FT_RMSE":         ft_metrics["RMSE"],
+            "n_test_windows":  len(pid_data[left_out_pid]["y"]),
+            "fms_range":       fms_range
+        })
+
+
+# =========================================================
+# I. RESULTS TABLE
+# =========================================================
+results_df = pd.DataFrame(results_rows)
+
+print("\n" + "="*65)
+print("PER-PARTICIPANT RESULTS")
+print("="*65)
+print(results_df.to_string(index=False))
+
+print("\n" + "="*65)
+print("AVERAGE BY MODEL (across all participants)")
+print("="*65)
+summary = (results_df.groupby("model")[["GEN_MAE","GEN_RMSE","FT_MAE","FT_RMSE"]]
+           .agg(["mean","std"]).round(4))
+print(summary)
+
+print("\n" + "="*65)
+print("AVERAGE BY MODEL × CLUSTER")
+print("="*65)
+summary_c = (results_df.groupby(["model","cluster"])[["GEN_MAE","GEN_RMSE","FT_MAE","FT_RMSE"]]
+             .mean().round(4))
+print(summary_c)
+
+
+# =========================================================
+# J. VISUALIZATION
+# =========================================================
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+fig, axes = plt.subplots(2, 2, figsize=(20, 12))
+colors    = {"LSTM": "#2196F3", "GRU": "#4CAF50", "TCN": "#FF5722"}
+bar_width = 0.25
+x         = np.arange(len(all_pids))
+
+metric_pairs = [
+    ("GEN_MAE",  "Generalized MAE"),
+    ("GEN_RMSE", "Generalized RMSE"),
+    ("FT_MAE",   "Fine-Tuned MAE"),
+    ("FT_RMSE",  "Fine-Tuned RMSE"),
+]
+
+for ax, (col, title) in zip(axes.flat, metric_pairs):
+    for i, model_name in enumerate(MODEL_NAMES):
+        vals = [
+            results_df[(results_df["pid"] == p) &
+                       (results_df["model"] == model_name)][col].values[0]
+            for p in all_pids
+        ]
+        offset = (i - 1) * bar_width
+        ax.bar(x + offset, vals, width=bar_width,
+               label=model_name, color=colors[model_name], alpha=0.85)
+
+    # shade by cluster
+    for i, pid in enumerate(all_pids):
+        c = cluster_map.get(pid, -1)
+        if c == 0:
+            ax.axvspan(i - 0.5, i + 0.5, color="blue", alpha=0.05, zorder=0)
+        else:
+            ax.axvspan(i - 0.5, i + 0.5, color="orange", alpha=0.05, zorder=0)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"P{p}" for p in all_pids], rotation=45, ha="right")
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(fontsize=8)
+
+# cluster legend
+c0_patch = mpatches.Patch(color="blue",   alpha=0.15, label="Cluster 0")
+c1_patch = mpatches.Patch(color="orange", alpha=0.15, label="Cluster 1")
+fig.legend(handles=[c0_patch, c1_patch], loc="lower center",
+           ncol=2, bbox_to_anchor=(0.5, -0.02))
+
+plt.suptitle(
+    "LOSO + Cluster Fine-Tuning: Generalized vs Fine-Tuned Performance\n"
+    "(background shading = cluster membership)",
+    fontsize=13
+)
+plt.tight_layout()
+plt.savefig("loso_cluster_ft_results.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print("\nDONE")
